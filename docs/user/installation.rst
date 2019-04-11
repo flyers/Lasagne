@@ -10,9 +10,10 @@ tight coupling to Theano, you will have to install a recent version of Theano
 (usually more recent than the latest official release!) fitting the version of
 Lasagne you choose to install.
 
-Most of the instructions below assume you are running a Linux or Mac system;
-please do not hesitate to suggest instructions for Windows via the *Edit on
-GitHub* link on the top right!
+Most of the instructions below assume you are running a Linux or Mac system,
+but are otherwise very generic. For detailed step-by-step instructions for
+specific platforms including Windows, check our `From Zero to Lasagne
+<https://github.com/Lasagne/Lasagne/wiki/From-Zero-to-Lasagne>`_ guides.
 
 If you run into any trouble, please check the `Theano installation instructions
 <http://deeplearning.net/software/theano/install.html>`_ which cover installing
@@ -227,11 +228,11 @@ To check whether it is found by Theano, run the following command:
 It will print ``True`` if everything is fine, or an error message otherwise.
 There are no additional steps required for Theano to make use of cuDNN.
 
-Docker images
-=============
+Docker
+======
 
-Instead of manually installing Theano and Lasagne on your machines as described
-above, you may want to use a pre-made `Docker <https://www.docker.com/whatisdocker>`_
+Instead of manually installing Theano and Lasagne on your machines as described above,
+you may want to use a pre-made `Docker <https://www.docker.com/what-docker>`_
 image: `Lasagne Docker (CPU) <https://hub.docker.com/r/kaixhin/lasagne/>`_ or
 `Lasagne Docker (CUDA) <https://hub.docker.com/r/kaixhin/cuda-lasagne/>`_. These
 are updated on a weekly basis with bleeding-edge builds of Theano and Lasagne.
@@ -240,8 +241,9 @@ Examples of running bash in a Docker container are as follows:
 .. code-block:: bash
 
   sudo docker run -it kaixhin/lasagne
-  sudo docker run -it --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia0 kaixhin/cuda-lasagne:7.0
+  sudo nvidia-docker run -it kaixhin/cuda-lasagne:7.0
 
-For a guide to Docker, see the `official docs <https://docs.docker.com/userguide/>`_.
-For more details on how to use the Lasagne Docker images, including requirements for
-CUDA support, consult the `source project <https://github.com/Kaixhin/dockerfiles>`_.
+For a guide to Docker, see the `official docs <https://docs.docker.com>`_.
+CUDA support requires `NVIDIA Docker <https://github.com/NVIDIA/nvidia-docker>`_.
+For more details on how to use the Lasagne Docker images,
+consult the `source project <https://github.com/Kaixhin/dockerfiles>`_.

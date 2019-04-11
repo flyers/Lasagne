@@ -3,8 +3,9 @@ Alternative convolution implementations for Theano
 """
 
 import numpy as np
-
 import theano.tensor as T
+
+from ..utils import int_types
 
 
 # 1D convolutions
@@ -41,7 +42,8 @@ def conv1d_sc(input, filters, image_shape=None, filter_shape=None,
 
 
 def conv1d_mc0(input, filters, image_shape=None, filter_shape=None,
-               border_mode='valid', subsample=(1,), filter_flip=True):
+               border_mode='valid', subsample=(1,), filter_flip=True,
+               num_groups=1):
     """
     using conv2d with width == 1
     """
@@ -59,21 +61,23 @@ def conv1d_mc0(input, filters, image_shape=None, filter_shape=None,
 
     if isinstance(border_mode, tuple):
         (border_mode,) = border_mode
-    if isinstance(border_mode, int):
+    if isinstance(border_mode, int_types):
         border_mode = (0, border_mode)
 
     input_mc0 = input.dimshuffle(0, 1, 'x', 2)
     filters_mc0 = filters.dimshuffle(0, 1, 'x', 2)
 
+    extra_kwargs = {'num_groups': num_groups} if num_groups > 1 else {}
     conved = T.nnet.conv2d(
         input_mc0, filters_mc0, image_shape_mc0, filter_shape_mc0,
         subsample=(1, subsample[0]), border_mode=border_mode,
-        filter_flip=filter_flip)
+        filter_flip=filter_flip, **extra_kwargs)
     return conved[:, :, 0, :]  # drop the unused dimension
 
 
 def conv1d_mc1(input, filters, image_shape=None, filter_shape=None,
-               border_mode='valid', subsample=(1,), filter_flip=True):
+               border_mode='valid', subsample=(1,), filter_flip=True,
+               num_groups=1):
     """
     using conv2d with height == 1
     """
@@ -91,16 +95,17 @@ def conv1d_mc1(input, filters, image_shape=None, filter_shape=None,
 
     if isinstance(border_mode, tuple):
         (border_mode,) = border_mode
-    if isinstance(border_mode, int):
+    if isinstance(border_mode, int_types):
         border_mode = (border_mode, 0)
 
     input_mc1 = input.dimshuffle(0, 1, 2, 'x')
     filters_mc1 = filters.dimshuffle(0, 1, 2, 'x')
 
+    extra_kwargs = {'num_groups': num_groups} if num_groups > 1 else {}
     conved = T.nnet.conv2d(
         input_mc1, filters_mc1, image_shape_mc1, filter_shape_mc1,
         subsample=(subsample[0], 1), border_mode=border_mode,
-        filter_flip=filter_flip)
+        filter_flip=filter_flip, **extra_kwargs)
     return conved[:, :, :, 0]  # drop the unused dimension
 
 

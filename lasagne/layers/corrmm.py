@@ -1,3 +1,5 @@
+import warnings
+
 import theano
 
 from .. import init
@@ -8,19 +10,40 @@ from .base import Layer
 from .conv import conv_output_length, BaseConvLayer
 from ..utils import as_tuple
 
-from theano.sandbox.cuda.basic_ops import gpu_contiguous
-from theano.sandbox.cuda.blas import GpuCorrMM
+# check if Theano's new GPU backend is available and in use
+try:
+    from theano import gpuarray as gpu
+except ImportError:
+    from theano.sandbox import gpuarray as gpu
+gpu_enabled = gpu.pygpu_activated
+# if not, try to fall back to Theano's old GPU backend
+if not gpu_enabled:
+    try:
+        from theano.sandbox import cuda as gpu
+    except Exception:  # Theano 0.10+ raises nose.SkipTest
+        gpu_enabled = False
+    else:
+        gpu_enabled = gpu.cuda_enabled
+# if either of the backends is available, use it, otherwise bail out
+if gpu_enabled:
+    gpu_contiguous = gpu.basic_ops.gpu_contiguous
+    GpuCorrMM = gpu.blas.GpuCorrMM
+else:
+    raise ImportError(
+        "requires GPU support -- see http://lasagne.readthedocs.org/en/"
+        "latest/user/installation.html#gpu-support")  # pragma: no cover
 
+if theano.config.floatX == 'float64':
+    warnings.warn("You are using a GPU layer with Theano configured for "
+                  "double precision (floatX=float64). Depending on your "
+                  "Theano version and GPU, this may be slow or unsupported. "
+                  "We recommend to configure Theano for single precision "
+                  "(floatX=float32); see http://lasagne.readthedocs.org/en/"
+                  "latest/user/installation.html#gpu-support.")
 
 __all__ = [
     "Conv2DMMLayer",
 ]
-
-
-if not theano.sandbox.cuda.cuda_enabled:
-    raise ImportError(
-            "requires GPU support -- see http://lasagne.readthedocs.org/en/"
-            "latest/user/installation.html#gpu-support")  # pragma: no cover
 
 
 class Conv2DMMLayer(BaseConvLayer):
@@ -113,6 +136,12 @@ class Conv2DMMLayer(BaseConvLayer):
         be set to ``True`` if weights are loaded into it that were learnt using
         a regular :class:`lasagne.layers.Conv2DLayer`, for example.
 
+    num_groups : int (default: 1)
+        The number of groups to split the input channels and output channels
+        into, such that data does not cross the group boundaries. Requires the
+        number of channels to be divisible by the number of groups, and
+        requires Theano 0.10 or later for more than one group.
+
     **kwargs
         Any additional keyword arguments are passed to the `Layer` superclass.
 
@@ -127,14 +156,16 @@ class Conv2DMMLayer(BaseConvLayer):
     def __init__(self, incoming, num_filters, filter_size, stride=(1, 1),
                  pad=0, untie_biases=False, W=init.GlorotUniform(),
                  b=init.Constant(0.), nonlinearity=nonlinearities.rectify,
-                 flip_filters=False, **kwargs):
+                 flip_filters=False, num_groups=1, **kwargs):
         super(Conv2DMMLayer, self).__init__(incoming, num_filters, filter_size,
                                             stride, pad, untie_biases, W, b,
-                                            nonlinearity, flip_filters, n=2,
-                                            **kwargs)
+                                            nonlinearity, flip_filters,
+                                            num_groups, n=2, **kwargs)
         border_mode = 'half' if self.pad == 'same' else self.pad
+        extra_kwargs = {'num_groups': num_groups} if num_groups > 1 else {}
         self.corr_mm_op = GpuCorrMM(subsample=self.stride,
-                                    border_mode=border_mode)
+                                    border_mode=border_mode,
+                                    **extra_kwargs)
 
     def convolve(self, input, **kwargs):
         filters = self.W

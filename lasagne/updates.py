@@ -18,6 +18,7 @@ a list of parameters as input and return an ordered dictionary of updates:
     adadelta
     adam
     adamax
+    amsgrad
 
 Two functions can be used to further modify the updates to include momentum:
 
@@ -42,12 +43,15 @@ This is often used when training recurrent neural networks.
 
 Examples
 --------
+Using :func:`nesterov_momentum` to define an update dictionary for a toy
+example network:
+
 >>> import lasagne
 >>> import theano.tensor as T
 >>> import theano
 >>> from lasagne.nonlinearities import softmax
 >>> from lasagne.layers import InputLayer, DenseLayer, get_output
->>> from lasagne.updates import sgd, apply_momentum
+>>> from lasagne.updates import nesterov_momentum
 >>> l_in = InputLayer((100, 20))
 >>> l1 = DenseLayer(l_in, num_units=3, nonlinearity=softmax)
 >>> x = T.matrix('x')  # shp: num_batch x num_features
@@ -55,9 +59,26 @@ Examples
 >>> l_out = get_output(l1, x)
 >>> params = lasagne.layers.get_all_params(l1)
 >>> loss = T.mean(T.nnet.categorical_crossentropy(l_out, y))
->>> updates_sgd = sgd(loss, params, learning_rate=0.0001)
->>> updates = apply_momentum(updates_sgd, params, momentum=0.9)
->>> train_function = theano.function([x, y], updates=updates)
+>>> updates = nesterov_momentum(loss, params, learning_rate=1e-4, momentum=.9)
+>>> train_fn = theano.function([x, y], updates=updates)
+
+With :func:`apply_momentum` and :func:`apply_nesterov_momentum`, we can add
+momentum to optimization schemes that do not usually support this:
+
+>>> updates = lasagne.updates.rmsprop(loss, params, learning_rate=0.0001)
+>>> updates = lasagne.updates.apply_momentum(updates, params, momentum=0.9)
+
+All optimization schemes support symbolic variables for their hyperparameters,
+such as shared variables. This allows to vary hyperparameters during training
+without recompiling the training function. Note that the dtypes must match the
+dtypes of the network parameters, which follow Theano's ``floatX`` setting.
+In the following example, we use :func:`lasagne.utils.floatX` to ensure this:
+
+>>> eta = theano.shared(lasagne.utils.floatX(0.001))
+>>> updates = lasagne.updates.adam(loss, params, learning_rate=eta)
+>>> train_fn = theano.function([x, y], updates=updates)
+>>> # we can now modify the learning rate at any time during training:
+>>> eta.set_value(lasagne.utils.floatX(eta.get_value() * 0.1))
 """
 
 from collections import OrderedDict
@@ -79,6 +100,7 @@ __all__ = [
     "adadelta",
     "adam",
     "adamax",
+    "amsgrad",
     "norm_constraint",
     "total_norm_constraint"
 ]
@@ -443,11 +465,14 @@ def rmsprop(loss_or_grads, params, learning_rate=1.0, rho=0.9, epsilon=1e-6):
     grads = get_or_compute_grads(loss_or_grads, params)
     updates = OrderedDict()
 
+    # Using theano constant to prevent upcasting of float32
+    one = T.constant(1)
+
     for param, grad in zip(params, grads):
         value = param.get_value(borrow=True)
         accu = theano.shared(np.zeros(value.shape, dtype=value.dtype),
                              broadcastable=param.broadcastable)
-        accu_new = rho * accu + (1 - rho) * grad ** 2
+        accu_new = rho * accu + (one - rho) * grad ** 2
         updates[accu] = accu_new
         updates[param] = param - (learning_rate * grad /
                                   T.sqrt(accu_new + epsilon))
@@ -458,8 +483,8 @@ def rmsprop(loss_or_grads, params, learning_rate=1.0, rho=0.9, epsilon=1e-6):
 def adadelta(loss_or_grads, params, learning_rate=1.0, rho=0.95, epsilon=1e-6):
     """ Adadelta updates
 
-    Scale learning rates by a the ratio of accumulated gradients to accumulated
-    step sizes, see [1]_ and notes for further description.
+    Scale learning rates by the ratio of accumulated gradients to accumulated
+    updates, see [1]_ and notes for further description.
 
     Parameters
     ----------
@@ -511,6 +536,9 @@ def adadelta(loss_or_grads, params, learning_rate=1.0, rho=0.95, epsilon=1e-6):
     grads = get_or_compute_grads(loss_or_grads, params)
     updates = OrderedDict()
 
+    # Using theano constant to prevent upcasting of float32
+    one = T.constant(1)
+
     for param, grad in zip(params, grads):
         value = param.get_value(borrow=True)
         # accu: accumulate gradient magnitudes
@@ -521,7 +549,7 @@ def adadelta(loss_or_grads, params, learning_rate=1.0, rho=0.95, epsilon=1e-6):
                                    broadcastable=param.broadcastable)
 
         # update accu (as in rmsprop)
-        accu_new = rho * accu + (1 - rho) * grad ** 2
+        accu_new = rho * accu + (one - rho) * grad ** 2
         updates[accu] = accu_new
 
         # compute parameter update, using the 'old' delta_accu
@@ -530,7 +558,7 @@ def adadelta(loss_or_grads, params, learning_rate=1.0, rho=0.95, epsilon=1e-6):
         updates[param] = param - learning_rate * update
 
         # update delta_accu (as accu, but accumulating updates)
-        delta_accu_new = rho * delta_accu + (1 - rho) * update ** 2
+        delta_accu_new = rho * delta_accu + (one - rho) * update ** 2
         updates[delta_accu] = delta_accu_new
 
     return updates
@@ -548,13 +576,13 @@ def adam(loss_or_grads, params, learning_rate=0.001, beta1=0.9,
         A scalar loss expression, or a list of gradient expressions
     params : list of shared variables
         The variables to generate update expressions for
-    learning_rate : float
+    learning_rate : float or symbolic scalar
         Learning rate
-    beta1 : float
+    beta1 : float or symbolic scalar
         Exponential decay rate for the first moment estimates.
-    beta2 : float
+    beta2 : float or symbolic scalar
         Exponential decay rate for the second moment estimates.
-    epsilon : float
+    epsilon : float or symbolic scalar
         Constant for numerical stability.
 
     Returns
@@ -578,8 +606,11 @@ def adam(loss_or_grads, params, learning_rate=0.001, beta1=0.9,
     t_prev = theano.shared(utils.floatX(0.))
     updates = OrderedDict()
 
+    # Using theano constant to prevent upcasting of float32
+    one = T.constant(1)
+
     t = t_prev + 1
-    a_t = learning_rate*T.sqrt(1-beta2**t)/(1-beta1**t)
+    a_t = learning_rate*T.sqrt(one-beta2**t)/(one-beta1**t)
 
     for param, g_t in zip(params, all_grads):
         value = param.get_value(borrow=True)
@@ -588,8 +619,8 @@ def adam(loss_or_grads, params, learning_rate=0.001, beta1=0.9,
         v_prev = theano.shared(np.zeros(value.shape, dtype=value.dtype),
                                broadcastable=param.broadcastable)
 
-        m_t = beta1*m_prev + (1-beta1)*g_t
-        v_t = beta2*v_prev + (1-beta2)*g_t**2
+        m_t = beta1*m_prev + (one-beta1)*g_t
+        v_t = beta2*v_prev + (one-beta2)*g_t**2
         step = a_t*m_t/(T.sqrt(v_t) + epsilon)
 
         updates[m_prev] = m_t
@@ -613,13 +644,13 @@ def adamax(loss_or_grads, params, learning_rate=0.002, beta1=0.9,
         A scalar loss expression, or a list of gradient expressions
     params : list of shared variables
         The variables to generate update expressions for
-    learning_rate : float
+    learning_rate : float or symbolic scalar
         Learning rate
-    beta1 : float
+    beta1 : float or symbolic scalar
         Exponential decay rate for the first moment estimates.
-    beta2 : float
+    beta2 : float or symbolic scalar
         Exponential decay rate for the weighted infinity norm estimates.
-    epsilon : float
+    epsilon : float or symbolic scalar
         Constant for numerical stability.
 
     Returns
@@ -637,8 +668,11 @@ def adamax(loss_or_grads, params, learning_rate=0.002, beta1=0.9,
     t_prev = theano.shared(utils.floatX(0.))
     updates = OrderedDict()
 
+    # Using theano constant to prevent upcasting of float32
+    one = T.constant(1)
+
     t = t_prev + 1
-    a_t = learning_rate/(1-beta1**t)
+    a_t = learning_rate/(one-beta1**t)
 
     for param, g_t in zip(params, all_grads):
         value = param.get_value(borrow=True)
@@ -647,12 +681,75 @@ def adamax(loss_or_grads, params, learning_rate=0.002, beta1=0.9,
         u_prev = theano.shared(np.zeros(value.shape, dtype=value.dtype),
                                broadcastable=param.broadcastable)
 
-        m_t = beta1*m_prev + (1-beta1)*g_t
+        m_t = beta1*m_prev + (one-beta1)*g_t
         u_t = T.maximum(beta2*u_prev, abs(g_t))
         step = a_t*m_t/(u_t + epsilon)
 
         updates[m_prev] = m_t
         updates[u_prev] = u_t
+        updates[param] = param - step
+
+    updates[t_prev] = t
+    return updates
+
+
+def amsgrad(loss_or_grads, params, learning_rate=0.001, beta1=0.9,
+            beta2=0.999, epsilon=1e-8):
+    """AMSGrad updates
+
+    AMSGrad updates implemented as in [1]_.
+
+    Parameters
+    ----------
+    loss_or_grads : symbolic expression or list of expressions
+        A scalar loss expression, or a list of gradient expressions
+    params : list of shared variables
+        The variables to generate update expressions for
+    learning_rate : float or symbolic scalar
+        Learning rate
+    beta1 : float or symbolic scalar
+        Exponential decay rate for the first moment estimates.
+    beta2 : float or symbolic scalar
+        Exponential decay rate for the second moment estimates.
+    epsilon : float or symbolic scalar
+        Constant for numerical stability.
+
+    Returns
+    -------
+    OrderedDict
+        A dictionary mapping each parameter to its update expression
+
+    References
+    ----------
+    .. [1] https://openreview.net/forum?id=ryQu7f-RZ
+    """
+    all_grads = get_or_compute_grads(loss_or_grads, params)
+    t_prev = theano.shared(utils.floatX(0.))
+    updates = OrderedDict()
+
+    # Using theano constant to prevent upcasting of float32
+    one = T.constant(1)
+
+    t = t_prev + 1
+    a_t = learning_rate*T.sqrt(one-beta2**t)/(one-beta1**t)
+
+    for param, g_t in zip(params, all_grads):
+        value = param.get_value(borrow=True)
+        m_prev = theano.shared(np.zeros(value.shape, dtype=value.dtype),
+                               broadcastable=param.broadcastable)
+        v_prev = theano.shared(np.zeros(value.shape, dtype=value.dtype),
+                               broadcastable=param.broadcastable)
+        v_hat_prev = theano.shared(np.zeros(value.shape, dtype=value.dtype),
+                                   broadcastable=param.broadcastable)
+
+        m_t = beta1*m_prev + (one-beta1)*g_t
+        v_t = beta2*v_prev + (one-beta2)*g_t**2
+        v_hat_t = T.maximum(v_hat_prev, v_t)
+        step = a_t*m_t/(T.sqrt(v_hat_t) + epsilon)
+
+        updates[m_prev] = m_t
+        updates[v_prev] = v_t
+        updates[v_hat_prev] = v_hat_t
         updates[param] = param - step
 
     updates[t_prev] = t

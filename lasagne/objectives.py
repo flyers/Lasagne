@@ -2,7 +2,7 @@
 Provides some minimal help with building loss expressions for training or
 validating a neural network.
 
-Five functions build element- or item-wise loss expressions from network
+Six functions build element- or item-wise loss expressions from network
 predictions and targets:
 
 .. autosummary::
@@ -13,6 +13,7 @@ predictions and targets:
     squared_error
     binary_hinge_loss
     multiclass_hinge_loss
+    huber_loss
 
 A convenience function aggregates such losses into a scalar expression
 suitable for differentiation:
@@ -75,9 +76,9 @@ without dropout or any other nondeterministic computation in between:
 This gives a loss expression good for monitoring validation error.
 """
 
-import theano.tensor.nnet
+import theano.tensor
 
-from lasagne.layers import get_output
+from .utils import as_theano_expression
 
 __all__ = [
     "binary_crossentropy",
@@ -86,9 +87,37 @@ __all__ = [
     "aggregate",
     "binary_hinge_loss",
     "multiclass_hinge_loss",
+    "huber_loss",
     "binary_accuracy",
     "categorical_accuracy"
 ]
+
+
+def align_targets(predictions, targets):
+    """Helper function turning a target 1D vector into a column if needed.
+    This way, combining a network of a single output unit with a target vector
+    works as expected by most users, not broadcasting outputs against targets.
+
+    Parameters
+    ----------
+    predictions : Theano tensor
+        Expression for the predictions of a neural network.
+    targets : Theano tensor
+        Expression or variable for corresponding targets.
+
+    Returns
+    -------
+    predictions : Theano tensor
+        The predictions unchanged.
+    targets : Theano tensor
+        If `predictions` is a column vector and `targets` is a 1D vector,
+        returns `targets` turned into a column vector. Otherwise, returns
+        `targets` unchanged.
+    """
+    if (getattr(predictions, 'broadcastable', None) == (False, True) and
+            getattr(targets, 'ndim', None) == 1):
+        targets = as_theano_expression(targets).dimshuffle(0, 'x')
+    return predictions, targets
 
 
 def binary_crossentropy(predictions, targets):
@@ -113,6 +142,7 @@ def binary_crossentropy(predictions, targets):
     This is the loss function of choice for binary classification problems
     and sigmoid output units.
     """
+    predictions, targets = align_targets(predictions, targets)
     return theano.tensor.nnet.binary_crossentropy(predictions, targets)
 
 
@@ -120,6 +150,9 @@ def categorical_crossentropy(predictions, targets):
     """Computes the categorical cross-entropy between predictions and targets.
 
     .. math:: L_i = - \\sum_j{t_{i,j} \\log(p_{i,j})}
+
+    :math:`p` are the predictions, :math:`t` are the targets, :math:`i`
+    denotes the data point and :math:`j` denotes the class.
 
     Parameters
     ----------
@@ -129,6 +162,8 @@ def categorical_crossentropy(predictions, targets):
     targets : Theano 2D tensor or 1D tensor
         Either targets in [0, 1] matching the layout of `predictions`, or
         a vector of int giving the correct class index per data point.
+        In the case of an integer vector argument, each element
+        represents the position of the '1' in a one-hot encoding.
 
     Returns
     -------
@@ -159,14 +194,15 @@ def squared_error(a, b):
     Returns
     -------
     Theano tensor
-        An expression for the item-wise squared difference.
+        An expression for the element-wise squared difference.
 
     Notes
     -----
     This is the loss function of choice for many regression problems
     or auto-encoders with linear output units.
     """
-    return (a - b)**2
+    a, b = align_targets(a, b)
+    return theano.tensor.square(a - b)
 
 
 def aggregate(loss, weights=None, mode='mean'):
@@ -217,7 +253,8 @@ def aggregate(loss, weights=None, mode='mean'):
                          "got %r" % mode)
 
 
-def binary_hinge_loss(predictions, targets, binary=True, delta=1):
+def binary_hinge_loss(predictions, targets, delta=1, log_odds=None,
+                      binary=True):
     """Computes the binary hinge loss between predictions and targets.
 
     .. math:: L_i = \\max(0, \\delta - t_i p_i)
@@ -225,14 +262,19 @@ def binary_hinge_loss(predictions, targets, binary=True, delta=1):
     Parameters
     ----------
     predictions : Theano tensor
-        Predictions in (0, 1), such as sigmoidal output of a neural network.
+        Predictions in (0, 1), such as sigmoidal output of a neural network
+        (or log-odds of predictions depending on `log_odds`).
     targets : Theano tensor
         Targets in {0, 1} (or in {-1, 1} depending on `binary`), such as
         ground truth labels.
-    binary : bool, default True
-        ``True`` if targets are in {0, 1}, ``False`` if they are in {-1, 1}
     delta : scalar, default 1
         The hinge loss margin
+    log_odds : bool, default None
+        ``False`` if predictions are sigmoid outputs in (0, 1), ``True`` if
+        predictions are sigmoid inputs, or log-odds. If ``None``, will assume
+        ``True``, but warn that the default will change to ``False``.
+    binary : bool, default True
+        ``True`` if targets are in {0, 1}, ``False`` if they are in {-1, 1}
 
     Returns
     -------
@@ -242,17 +284,32 @@ def binary_hinge_loss(predictions, targets, binary=True, delta=1):
     Notes
     -----
     This is an alternative to the binary cross-entropy loss for binary
-    classification problems
+    classification problems.
+
+    Note that it is a drop-in replacement only when giving ``log_odds=False``.
+    Otherwise, it requires log-odds rather than sigmoid outputs. Be aware that
+    depending on the Theano version, ``log_odds=False`` with a sigmoid
+    output layer may be less stable than ``log_odds=True`` with a linear layer.
     """
+    if log_odds is None:  # pragma: no cover
+        raise FutureWarning(
+                "The `log_odds` argument to `binary_hinge_loss` will change "
+                "its default to `False` in a future version. Explicitly give "
+                "`log_odds=True` to retain current behavior in your code, "
+                "but also check the documentation if this is what you want.")
+        log_odds = True
+    if not log_odds:
+        predictions = theano.tensor.log(predictions / (1 - predictions))
     if binary:
         targets = 2 * targets - 1
+    predictions, targets = align_targets(predictions, targets)
     return theano.tensor.nnet.relu(delta - predictions * targets)
 
 
 def multiclass_hinge_loss(predictions, targets, delta=1):
     """Computes the multi-class hinge loss between predictions and targets.
 
-    .. math:: L_i = \\max_{j \\not = p_i} (0, t_j - t_{p_i} + \\delta)
+    .. math:: L_i = \\max_{j \\not = t_i} (0, p_j - p_{t_i} + \\delta)
 
     Parameters
     ----------
@@ -288,6 +345,53 @@ def multiclass_hinge_loss(predictions, targets, delta=1):
     return theano.tensor.nnet.relu(rest - corrects + delta)
 
 
+def huber_loss(predictions, targets, delta=1):
+    """ Computes the huber loss between predictions and targets.
+
+    .. math:: L_i = \\frac{(p - t)^2}{2},  |p - t| \\le \\delta
+
+        L_i = \\delta (|p - t| - \\frac{\\delta}{2} ), |p - t| \\gt \\delta
+
+    Parameters
+    ----------
+    predictions : Theano 2D tensor or 1D tensor
+        Prediction outputs of a neural network.
+
+    targets : Theano 2D tensor or 1D tensor
+        Ground truth to which the prediction is to be compared
+        with. Either a vector or 2D Tensor.
+
+    delta : scalar, default 1
+        This delta value is defaulted to 1, for `SmoothL1Loss`
+        described in Fast-RCNN paper [1]_ .
+
+    Returns
+    -------
+    Theano tensor
+        An expression for the element-wise huber loss [2]_ .
+
+    Notes
+    -----
+    This is an alternative to the squared error for
+    regression problems.
+
+    References
+    ----------
+    .. [1] Ross Girshick et al (2015):
+           Fast RCNN
+           https://arxiv.org/pdf/1504.08083.pdf
+
+    .. [2] Huber, Peter et al (1964)
+           Robust Estimation of a Location Parameter
+           https://projecteuclid.org/euclid.aoms/1177703732
+    """
+    predictions, targets = align_targets(predictions, targets)
+    abs_diff = abs(targets - predictions)
+    ift = 0.5 * squared_error(targets, predictions)
+    iff = delta * (abs_diff - delta / 2.)
+    return theano.tensor.switch(abs_diff <= delta, ift, iff)
+
+
 def binary_accuracy(predictions, targets, threshold=0.5):
     """Computes the binary accuracy between predictions and targets.
 
@@ -318,6 +422,7 @@ def binary_accuracy(predictions, targets, threshold=0.5):
     To obtain the average accuracy, call :func:`theano.tensor.mean()` on the
     result, passing ``dtype=theano.config.floatX`` to compute the mean on GPU.
     """
+    predictions, targets = align_targets(predictions, targets)
     predictions = theano.tensor.ge(predictions, threshold)
     return theano.tensor.eq(predictions, targets)
 

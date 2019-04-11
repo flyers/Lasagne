@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import theano
 import theano.tensor as T
@@ -10,6 +12,18 @@ from .base import Layer
 from .conv import conv_output_length, BaseConvLayer
 from .pool import pool_output_length
 from ..utils import as_tuple
+
+# bail out if using Theano's new GPU backend
+try:
+    from theano import gpuarray
+except ImportError:
+    from theano.sandbox import gpuarray
+if gpuarray.pygpu_activated:
+    raise ImportError("cuda_convnet is not supported under Theano's new "
+                      "GPU backend. Please either use the ordinary "
+                      "convolutional and pooling layers (they are usually "
+                      "faster), or use Theano's old GPU backend (available "
+                      "up to Theano 0.9).")  # pragma: no cover
 
 from theano.sandbox.cuda.basic_ops import gpu_contiguous
 from pylearn2.sandbox.cuda_convnet.filter_acts import FilterActs
@@ -29,6 +43,14 @@ if not theano.sandbox.cuda.cuda_enabled:
     raise ImportError(
             "requires GPU support -- see http://lasagne.readthedocs.org/en/"
             "latest/user/installation.html#gpu-support")  # pragma: no cover
+
+if theano.config.floatX == 'float64':
+    warnings.warn("You are using a GPU layer with Theano configured for "
+                  "double precision (floatX=float64). Depending on your "
+                  "Theano version and GPU, this may be slow or unsupported. "
+                  "We recommend to configure Theano for single precision "
+                  "(floatX=float32); see http://lasagne.readthedocs.org/en/"
+                  "latest/user/installation.html#gpu-support.")
 
 
 class Conv2DCCLayer(BaseConvLayer):

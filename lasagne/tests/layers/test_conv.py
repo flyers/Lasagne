@@ -2,12 +2,30 @@ import numpy as np
 import pytest
 import importlib
 import theano
+from theano import tensor as T
 
 import lasagne
 from lasagne.utils import floatX, as_tuple
 
+try:
+    from theano import gpuarray
+    theano_backend = "pygpu"
+except ImportError:
+    from theano.sandbox import gpuarray
+    theano_backend = "pygpu_sandbox"
+gpu = gpuarray.pygpu_activated
+if not gpu:
+    try:
+        from theano.sandbox import cuda
+        theano_backend = "cuda_sandbox"
+        gpu = cuda.cuda_enabled
+    except Exception:  # Theano 0.10+ raises nose.SkipTest
+        gpu = False
+    if not gpu:
+        theano_backend = "cpu"
 
-def convNd(input, kernel, pad, stride=1, n=None):
+
+def convNd(input, kernel, pad, stride=1, groups=1, n=None):
     """Execute a batch of a stack of N-dimensional convolutions.
 
     Parameters
@@ -16,12 +34,20 @@ def convNd(input, kernel, pad, stride=1, n=None):
     kernel : numpy array
     pad : {0, 'valid', 'same', 'full'}, int or tuple of int
     stride : int or tuple of int
+    groups: int
     n : int
 
     Returns
     -------
     numpy array
     """
+    if groups > 1:
+        input = input.reshape(input.shape[0], groups, -1, *input.shape[2:])
+        kernel = kernel.reshape(groups, -1, *kernel.shape[1:])
+        return np.concatenate([convNd(input[:, g], kernel[g], pad, stride,
+                                      groups=1, n=n)
+                               for g in range(groups)], axis=1)
+
     if n is None:
         n = input.ndim - 2
     if pad not in ['valid', 'same', 'full']:
@@ -80,6 +106,43 @@ def convNd(input, kernel, pad, stride=1, n=None):
     return output
 
 
+def dilate(input, factors):
+    """Inserts `factors[i] - 1` zeros between input elements on axis i."""
+    output = np.zeros(tuple((s-1)*f + 1 for s, f in zip(input.shape, factors)),
+                      dtype=input.dtype)
+    output[[slice(None, None, factor) for factor in factors]] = input
+    return output
+
+
+def transposed_convNd(input, kernel, crop, stride=1, n=None, extend=None):
+    if n is None:
+        n = input.ndim - 2
+    if crop == 'valid':
+        pad = 'full'
+    elif crop == 'full':
+        pad = 'valid'
+    elif crop == 'same':
+        pad = 'same'
+    else:
+        crop = as_tuple(crop, n, int)
+        pad = tuple(f - 1 - c for f, c in zip(kernel.shape[2:], crop))
+    stride = as_tuple(stride, n, int)
+    dilated_input = dilate(input, (1, 1) + stride)
+    if extend is not None:
+        extend = as_tuple(extend, n, int)
+        extend = [(0, p) for p in (0, 0) + extend]
+        dilated_input = np.pad(dilated_input, extend, mode='constant')
+    return convNd(dilated_input, kernel, pad, stride=1, n=n)
+
+
+def dilated_convNd(input, kernel, pad, dilation=1, n=None):
+    if n is None:
+        n = input.ndim - 2
+    dilation = as_tuple(dilation, n, int)
+    dilated_kernel = dilate(kernel, (1, 1) + dilation)
+    return convNd(input, dilated_kernel, pad, stride=1, n=n)
+
+
 def convNd_test_sets(n):
     def _convert(input, kernel, output, kwargs):
         return [theano.shared(floatX(input)), floatX(kernel), output, kwargs]
@@ -116,6 +179,14 @@ def convNd_test_sets(n):
     output = convNd(input, kernel[flip], pad='valid')
     yield _convert(input, kernel, output, {'flip_filters': False})
 
+    # num_groups=3 case
+    input_shape = (2, 6) + extra_shape[-n:]
+    input = np.random.random(input_shape)
+    kernel = np.random.random((9, 2) + (3,) * n)
+    output = convNd(input, kernel, pad='valid', groups=3)
+    yield _convert(input, kernel, output, {'num_groups': 3,
+                                           'flip_filters': True})
+
 
 def conv3d_test_sets():
     return convNd_test_sets(3)
@@ -129,6 +200,129 @@ def conv1d_test_sets():
     return convNd_test_sets(1)
 
 
+def transp_conv2d_test_sets():
+    def _convert(input, kernel, output, kwargs):
+        return [floatX(input), floatX(kernel), output, kwargs]
+
+    input_shape = (3, 1, 11, 16)
+    for crop in (0, 1, 2, 'full', 'same'):
+        for stride in (1, 2, 3):
+            for filter_size in (1, 3):
+                if stride > filter_size:
+                    continue
+                if crop not in ('full', 'same') and crop > (filter_size - 1):
+                    continue
+                input = np.random.random(input_shape)
+                kernel = np.random.random((16, 1, filter_size, filter_size))
+                output = transposed_convNd(input, kernel, crop, stride, 2)
+                yield _convert(input, kernel, output, {'crop': crop,
+                                                       'stride': stride,
+                                                       'flip_filters': True})
+
+    # bias-less case
+    input = np.random.random(input_shape)
+    kernel = np.random.random((16, 1, 3, 3))
+    output = transposed_convNd(input, kernel, 'valid')
+    yield _convert(input, kernel, output, {'b': None, 'flip_filters': True})
+    # untie_biases=True case
+    yield _convert(input, kernel, output, {'untie_biases': True,
+                                           'flip_filters': True})
+    # crop='valid' case
+    yield _convert(input, kernel, output, {'crop': 'valid',
+                                           'flip_filters': True})
+    # flip_filters=False case
+    output = transposed_convNd(input, kernel[:, :, ::-1, ::-1], 'valid')
+    yield _convert(input, kernel, output, {'flip_filters': False})
+    # extend (w/ and w/out symbolic output shape)
+    for symbolic in [False, True]:
+        input_shape = (4, 3, 7, 9)
+        input = np.random.random(input_shape)
+        kernel = np.random.random((16, 3, 2, 3))
+        stride = (2, 3)
+        for extend in [(0, 1), (1, 2)]:
+            output = transposed_convNd(input, kernel, 0, stride, extend=extend)
+            kwargs = {'stride': stride, 'flip_filters': True}
+            if symbolic:
+                kwargs['output_size'] = theano.shared(
+                    np.array(output.shape[2:]))
+            else:
+                kwargs['output_size'] = output.shape[2:]
+            yield _convert(input, kernel, output, kwargs)
+
+
+def transp_conv3d_test_sets():
+    def _convert(input, kernel, output, kwargs):
+        return [floatX(input), floatX(kernel), output, kwargs]
+
+    input_shape = (3, 1, 9, 11, 16)
+    for crop in (0, 1, 2, 'full', 'same'):
+        for stride in (1, 2, 3):
+            for filter_size in (1, 3):
+                if stride > filter_size:
+                    continue
+                if crop not in ('full', 'same') and crop > (filter_size - 1):
+                    continue
+                input = np.random.random(input_shape)
+                kernel = np.random.random((16, 1, filter_size, filter_size,
+                                           filter_size))
+                output = transposed_convNd(input, kernel, crop, stride, 3)
+                yield _convert(input, kernel, output, {'crop': crop,
+                                                       'stride': stride,
+                                                       'flip_filters': True})
+
+    # bias-less case
+    input = np.random.random(input_shape)
+    kernel = np.random.random((16, 1, 3, 3, 3))
+    output = transposed_convNd(input, kernel, 'valid')
+    yield _convert(input, kernel, output, {'b': None, 'flip_filters': True})
+    # untie_biases=True case
+    yield _convert(input, kernel, output, {'untie_biases': True,
+                                           'flip_filters': True})
+    # crop='valid' case
+    yield _convert(input, kernel, output, {'crop': 'valid',
+                                           'flip_filters': True})
+    # flip_filters=False case
+    output = transposed_convNd(input, kernel[:, :, ::-1, ::-1, ::-1], 'valid')
+    yield _convert(input, kernel, output, {'flip_filters': False})
+    # extend (w/ and w/out symbolic output shape)
+    for symbolic in [False, True]:
+        input_shape = (4, 3, 7, 9, 11)
+        input = np.random.random(input_shape)
+        kernel = np.random.random((16, 3, 2, 3, 5))
+        stride = (2, 3, 5)
+        for extend in [(0, 1, 3), (1, 2, 4)]:
+            output = transposed_convNd(input, kernel, 0, stride, extend=extend)
+            kwargs = {'stride': stride, 'flip_filters': True}
+            if symbolic:
+                kwargs['output_size'] = theano.shared(
+                    np.array(output.shape[2:]))
+            else:
+                kwargs['output_size'] = output.shape[2:]
+            yield _convert(input, kernel, output, kwargs)
+
+
+def dilated_conv2d_test_sets():
+    def _convert(input, kernel, output, kwargs):
+        return [floatX(input), floatX(kernel), output, kwargs]
+
+    input_shape = (3, 1, 11, 16)
+    for dilation in (1, 2, 3):
+        for filter_size in (1, 3):
+            input = np.random.random(input_shape)
+            kernel = np.random.random((16, 1, filter_size, filter_size))
+            kernel_flip = kernel[:, :, ::-1, ::-1]
+            output = dilated_convNd(input, kernel_flip, 'valid', dilation, 2)
+            yield _convert(input, kernel, output, {'dilation': dilation})
+
+    # bias-less case
+    input = np.random.random(input_shape)
+    kernel = np.random.random((16, 1, 3, 3))
+    output = dilated_convNd(input, kernel[:, :, ::-1, ::-1], pad='valid')
+    yield _convert(input, kernel, output, {'b': None})
+    # untie_biases=True case
+    yield _convert(input, kernel, output, {'untie_biases': True})
+
+
 def test_conv_output_length():
     from lasagne.layers.conv import conv_output_length
 
@@ -140,6 +334,27 @@ def test_conv_output_length():
 
     with pytest.raises(ValueError) as exc:
         conv_output_length(13, 5, 3, '_nonexistent_mode')
+    assert "Invalid pad: " in exc.value.args[0]
+
+
+def test_conv_input_length():
+    from lasagne.layers.conv import conv_input_length
+
+    # using the examples from https://github.com/vdumoulin/conv_arithmetic
+    # no padding, no strides
+    assert conv_input_length(2, 3, 1, 'valid') == 4
+    assert conv_input_length(2, 3, 1, 0) == 4
+    # padding, no strides
+    assert conv_input_length(6, 4, 1, 2) == 5
+    # no padding, strides
+    assert conv_input_length(2, 3, 2, 0) == 5
+    # padding, strides
+    assert conv_input_length(3, 3, 2, 'same') == 5
+    # full convolution
+    assert conv_input_length(3, 3, 2, 'full') == 3
+
+    with pytest.raises(ValueError) as exc:
+        conv_input_length(3, 5, 3, '_nonexistent_mode')
     assert "Invalid pad: " in exc.value.args[0]
 
 
@@ -175,6 +390,20 @@ class TestBaseConvLayer:
             BaseConvLayer((10, 20, 30, 40), 1, 3, n=1)
         assert "Expected 3 input dimensions" in exc.value.args[0]
 
+    def test_fail_on_mismatching_groups(self):
+        from lasagne.layers.conv import BaseConvLayer
+        with pytest.raises(ValueError) as exc:
+            BaseConvLayer((2, 3, 4), 1, 3, num_groups=2)
+        assert "evenly divide" in exc.value.args[0]
+        with pytest.raises(ValueError) as exc:
+            BaseConvLayer((2, 3, 4), 1, 3, num_groups=-3)
+        assert "must be positive" in exc.value.args[0]
+
+    def test_integer_types(self):
+        from lasagne.layers.conv import BaseConvLayer
+        BaseConvLayer((2, 3, 4), np.int64(1), np.int64(3))
+        BaseConvLayer((2, 3, 4, 5), 1, np.empty((3, 3)).shape)
+
 
 class TestConv1DLayer:
 
@@ -198,7 +427,7 @@ class TestConv1DLayer:
             assert actual.shape == layer.output_shape
             assert np.allclose(actual, output)
 
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pass
 
     def test_init_none_nonlinearity_bias(self, DummyInputLayer):
@@ -261,7 +490,7 @@ class TestConv2DLayerImplementations:
             assert actual.shape == layer.output_shape
             assert np.allclose(actual, output)
 
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pytest.skip()
 
     @pytest.mark.parametrize(
@@ -289,7 +518,7 @@ class TestConv2DLayerImplementations:
             assert actual.shape == output.shape
             assert np.allclose(actual, output)
 
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pytest.skip()
 
     def test_init_none_nonlinearity_bias(self, Conv2DImpl, DummyInputLayer):
@@ -327,6 +556,7 @@ class TestConv3DLayerImplementations:
 
     @pytest.fixture(
         params=[
+            ('lasagne.layers', 'Conv3DLayer'),
             ('lasagne.layers.dnn', 'Conv3DDNNLayer'),
         ],
     )
@@ -334,17 +564,16 @@ class TestConv3DLayerImplementations:
         impl_module_name, impl_name = request.param
         try:
             mod = importlib.import_module(impl_module_name)
-        except ImportError:
+            return getattr(mod, impl_name)
+        except (ImportError, AttributeError):
             pytest.skip("{} not available".format(impl_module_name))
-
-        return getattr(mod, impl_name)
 
     @pytest.mark.parametrize(
         "input, kernel, output, kwargs", list(conv3d_test_sets()))
     def test_defaults(self, Conv3DImpl, DummyInputLayer,
                       input, kernel, output, kwargs):
-        b, c, h, w, d = input.shape.eval()
-        input_layer = DummyInputLayer((b, c, h, w, d))
+        b, c, d, h, w = input.shape.eval()
+        input_layer = DummyInputLayer((b, c, d, h, w))
         try:
             layer = Conv3DImpl(
                 input_layer,
@@ -358,7 +587,7 @@ class TestConv3DLayerImplementations:
             assert actual.shape == layer.output_shape
             assert np.allclose(actual, output)
 
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pytest.skip()
 
     @pytest.mark.parametrize(
@@ -367,7 +596,7 @@ class TestConv3DLayerImplementations:
                         input, kernel, output, kwargs):
         if kwargs.get('untie_biases', False):
             pytest.skip()
-        b, c, h, w, d = input.shape.eval()
+        b, c, d, h, w = input.shape.eval()
         input_layer = DummyInputLayer((None, c, None, None, None))
         try:
             layer = Conv3DImpl(
@@ -387,7 +616,7 @@ class TestConv3DLayerImplementations:
             assert actual.shape == output.shape
             assert np.allclose(actual, output)
 
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pytest.skip()
 
     def test_init_none_nonlinearity_bias(self, Conv3DImpl, DummyInputLayer):
@@ -423,11 +652,199 @@ class TestConv3DLayerImplementations:
         assert layer.get_params(_nonexistent_tag=False) == [layer.W, layer.b]
 
 
+class TestTransposedConv2DLayer:
+    @pytest.mark.parametrize(
+        "input, kernel, output, kwargs", list(transp_conv2d_test_sets()))
+    def test_defaults(self, DummyInputLayer, input, kernel, output, kwargs):
+        from lasagne.layers import TransposedConv2DLayer
+        b, c, h, w = input.shape
+        input_layer = DummyInputLayer((b, c, h, w))
+        layer = TransposedConv2DLayer(
+                input_layer,
+                num_filters=kernel.shape[0],
+                filter_size=kernel.shape[2:],
+                W=kernel.transpose(1, 0, 2, 3),
+                **kwargs)
+        actual = layer.get_output_for(input).eval()
+        assert actual.shape == output.shape
+        # layer.output_shape == actual.shape or None
+        assert all([s1 == s2 for (s1, s2) in
+                    zip(actual.shape, output.shape) if s2])
+        assert np.allclose(actual, output)
+        # Check get_output_shape_for for symbolic output
+        if 'output_size' in kwargs and isinstance(kwargs['output_size'],
+                                                  T.Variable):
+            assert all(el is None for el in
+                       layer.get_output_shape_for(input.shape)[2:])
+
+    @pytest.mark.parametrize(
+        "input, kernel, output, kwargs", list(transp_conv2d_test_sets()))
+    def test_with_nones(self, DummyInputLayer, input, kernel, output, kwargs):
+        if kwargs.get('untie_biases', False):
+            pytest.skip()
+        from lasagne.layers import TransposedConv2DLayer
+        b, c, h, w = input.shape
+        input_layer = DummyInputLayer((None, c, None, None))
+        layer = TransposedConv2DLayer(
+                input_layer,
+                num_filters=kernel.shape[0],
+                filter_size=kernel.shape[2:],
+                W=kernel.transpose(1, 0, 2, 3),
+                **kwargs)
+        if 'output_size' not in kwargs or isinstance(kwargs['output_size'],
+                                                     T.Variable):
+            assert layer.output_shape == (None, output.shape[1], None, None)
+        actual = layer.get_output_for(input).eval()
+        assert actual.shape == output.shape
+        assert np.allclose(actual, output)
+        # Check get_output_shape_for for non symbolic output
+        if 'output_size' in kwargs and not isinstance(kwargs['output_size'],
+                                                      T.Variable):
+            assert layer.get_output_shape_for(input.shape) == output.shape
+            # The layer should report the output size even when it
+            # doesn't know most of the input size
+            assert layer.output_shape == (
+                None, output.shape[1]) + kwargs['output_size']
+
+
+class TestTransposedConv3DLayer:
+    @pytest.fixture(
+        params=[
+            ('lasagne.layers', 'TransposedConv3DLayer')
+        ],
+    )
+    def TransposedConv3DLayerImpl(self, request):
+        impl_module_name, impl_name = request.param
+        try:
+            mod = importlib.import_module(impl_module_name)
+            return getattr(mod, impl_name)
+        except (ImportError, AttributeError):
+            pytest.skip("{} not available".format(impl_module_name))
+
+    @pytest.mark.parametrize(
+        "input, kernel, output, kwargs", list(transp_conv3d_test_sets()))
+    def test_defaults(self, TransposedConv3DLayerImpl, DummyInputLayer,
+                      input, kernel, output, kwargs):
+        b, c, d, h, w = input.shape
+        input_layer = DummyInputLayer((b, c, d, h, w))
+        try:
+            layer = TransposedConv3DLayerImpl(
+                    input_layer,
+                    num_filters=kernel.shape[0],
+                    filter_size=kernel.shape[2:],
+                    W=kernel.transpose(1, 0, 2, 3, 4),
+                    **kwargs)
+            actual = layer.get_output_for(input).eval()
+            assert actual.shape == output.shape
+            # layer.output_shape == actual.shape or None
+            assert all([s1 == s2 for (s1, s2) in
+                        zip(actual.shape, output.shape) if s2])
+            assert np.allclose(actual, output)
+            # Check get_output_shape_for for symbolic output
+            if 'output_size' in kwargs and isinstance(kwargs['output_size'],
+                                                      T.Variable):
+                assert all(el is None for el in
+                           layer.get_output_shape_for(input.shape)[2:])
+        except NotImplementedError:
+            pytest.skip()
+
+    @pytest.mark.parametrize(
+        "input, kernel, output, kwargs", list(transp_conv3d_test_sets()))
+    def test_with_nones(self, TransposedConv3DLayerImpl, DummyInputLayer,
+                        input, kernel, output, kwargs):
+        if kwargs.get('untie_biases', False):
+            pytest.skip()
+        b, c, d, h, w = input.shape
+        input_layer = DummyInputLayer((None, c, None, None, None))
+        try:
+            layer = TransposedConv3DLayerImpl(
+                    input_layer,
+                    num_filters=kernel.shape[0],
+                    filter_size=kernel.shape[2:],
+                    W=kernel.transpose(1, 0, 2, 3, 4),
+                    **kwargs)
+            if 'output_size' not in kwargs or \
+                    isinstance(kwargs['output_size'], T.Variable):
+                assert layer.output_shape == (None, output.shape[1],
+                                              None, None, None)
+            actual = layer.get_output_for(input).eval()
+            assert actual.shape == output.shape
+            assert np.allclose(actual, output)
+            # Check get_output_shape_for for non symbolic output
+            if 'output_size' in kwargs and not \
+                    isinstance(kwargs['output_size'], T.Variable):
+                assert layer.get_output_shape_for(input.shape) == output.shape
+                # The layer should report the output size even when it
+                # doesn't know most of the input size
+                assert layer.output_shape == (
+                    None, output.shape[1]) + kwargs['output_size']
+        except NotImplementedError:
+            pytest.skip()
+
+
+class TestDilatedConv2DLayer:
+    @pytest.mark.parametrize(
+        "input, kernel, output, kwargs", list(dilated_conv2d_test_sets()))
+    def test_defaults(self, DummyInputLayer, input, kernel, output, kwargs):
+        from lasagne.layers import DilatedConv2DLayer
+        b, c, h, w = input.shape
+        input_layer = DummyInputLayer((b, c, h, w))
+        layer = DilatedConv2DLayer(
+                input_layer,
+                num_filters=kernel.shape[0],
+                filter_size=kernel.shape[2:],
+                W=kernel.transpose(1, 0, 2, 3),
+                **kwargs)
+        actual = layer.get_output_for(theano.shared(input)).eval()
+        assert actual.shape == output.shape
+        assert actual.shape == layer.output_shape
+        assert np.allclose(actual, output)
+
+    @pytest.mark.parametrize(
+        "input, kernel, output, kwargs", list(dilated_conv2d_test_sets()))
+    def test_with_nones(self, DummyInputLayer, input, kernel, output, kwargs):
+        if kwargs.get('untie_biases', False):
+            pytest.skip()
+        from lasagne.layers import DilatedConv2DLayer
+        b, c, h, w = input.shape
+        input_layer = DummyInputLayer((None, c, None, None))
+        layer = DilatedConv2DLayer(
+                input_layer,
+                num_filters=kernel.shape[0],
+                filter_size=kernel.shape[2:],
+                W=kernel.transpose(1, 0, 2, 3),
+                **kwargs)
+        assert layer.output_shape == (None, output.shape[1], None, None)
+        actual = layer.get_output_for(input).eval()
+        assert actual.shape == output.shape
+        assert np.allclose(actual, output)
+
+    def test_unsupported_settings(self, DummyInputLayer):
+        from lasagne.layers import DilatedConv2DLayer
+        input_layer = DummyInputLayer((10, 20, 30, 40))
+        for pad in 'same', 'full', 1:
+            with pytest.raises(NotImplementedError) as exc:
+                DilatedConv2DLayer(input_layer, 2, 3, pad=pad)
+            assert "requires pad=0" in exc.value.args[0]
+        with pytest.raises(NotImplementedError) as exc:
+            DilatedConv2DLayer(input_layer, 2, 3, flip_filters=True)
+        assert "requires flip_filters=False" in exc.value.args[0]
+
+
 class TestConv2DDNNLayer:
     def test_import_without_gpu_or_cudnn_raises(self):
-        from theano.sandbox import cuda
-        if cuda.cuda_enabled and cuda.dnn.dnn_available():
-            pytest.skip()
+        if theano_backend == 'pygpu':
+            from theano.gpuarray import dnn
+            if dnn.dnn_present():
+                pytest.skip()
+        elif theano_backend == 'pygpu_sandbox':
+            from theano.sandbox.gpuarray import dnn
+            if dnn.dnn_present():
+                pytest.skip()
+        elif theano_backend == 'cuda_sandbox':
+            from theano.sandbox.cuda import dnn
+            if dnn.dnn_available():
+                pytest.skip()
         else:
             with pytest.raises(ImportError):
                 import lasagne.layers.dnn
@@ -435,8 +852,7 @@ class TestConv2DDNNLayer:
 
 class TestConv2DMMLayer:
     def test_import_without_gpu_raises(self):
-        from theano.sandbox import cuda
-        if cuda.cuda_enabled:
+        if theano_backend in ['pygpu', 'pygpu_sandbox', 'cuda_sandbox']:
             pytest.skip()
         else:
             with pytest.raises(ImportError):
@@ -445,8 +861,7 @@ class TestConv2DMMLayer:
 
 class TestConv2DCCLayer:
     def test_import_without_gpu_raises(self):
-        from theano.sandbox import cuda
-        if cuda.cuda_enabled:
+        if theano_backend in ['pygpu', 'pygpu_sandbox', 'cuda_sandbox']:
             pytest.skip()
         else:
             with pytest.raises(ImportError):

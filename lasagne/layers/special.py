@@ -4,7 +4,7 @@ import numpy as np
 
 from .. import init
 from .. import nonlinearities
-from ..utils import as_tuple, floatX
+from ..utils import as_tuple, floatX, int_types
 from ..random import get_rng
 from .base import Layer, MergeLayer
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
@@ -94,7 +94,7 @@ class BiasLayer(Layer):
         if shared_axes == 'auto':
             # default: share biases over all but the second axis
             shared_axes = (0,) + tuple(range(2, len(self.input_shape)))
-        elif isinstance(shared_axes, int):
+        elif isinstance(shared_axes, int_types):
             shared_axes = (shared_axes,)
         self.shared_axes = shared_axes
 
@@ -161,7 +161,7 @@ class ScaleLayer(Layer):
         if shared_axes == 'auto':
             # default: share scales over all but the second axis
             shared_axes = (0,) + tuple(range(2, len(self.input_shape)))
-        elif isinstance(shared_axes, int):
+        elif isinstance(shared_axes, int_types):
             shared_axes = (shared_axes,)
         self.shared_axes = shared_axes
 
@@ -335,7 +335,8 @@ class InverseLayer(MergeLayer):
     >>> l_in = InputLayer((100, 3, 28, 28))
     >>> l1 = Conv2DLayer(l_in, num_filters=16, filter_size=5)
     >>> l2 = DenseLayer(l1, num_units=20)
-    >>> l_u = InverseLayer(l2, l1)  # As Deconv2DLayer
+    >>> l_u2 = InverseLayer(l2, l2)  # backprop through l2
+    >>> l_u1 = InverseLayer(l_u2, l1)  # backprop through l1
     """
     def __init__(self, incoming, layer, **kwargs):
 
@@ -375,6 +376,12 @@ class TransformerLayer(MergeLayer):
         output image (in both spatial dimensions). A value of 1 will keep the
         original size of the input. Values larger than 1 will downsample the
         input. Values below 1 will upsample the input.
+    border_mode : 'nearest', 'mirror', or 'wrap'
+        Determines how border conditions are handled during interpolation.  If
+        'nearest', points outside the grid are clipped to the boundary. If
+        'mirror', points are mirrored across the boundary. If 'wrap', points
+        wrap around to the other side of the grid.  See
+        http://stackoverflow.com/q/22669252/22670830#22670830 for details.
 
     References
     ----------
@@ -404,10 +411,11 @@ class TransformerLayer(MergeLayer):
     >>> l_trans = lasagne.layers.TransformerLayer(l_in, l_loc)
     """
     def __init__(self, incoming, localization_network, downsample_factor=1,
-                 **kwargs):
+                 border_mode='nearest', **kwargs):
         super(TransformerLayer, self).__init__(
             [incoming, localization_network], **kwargs)
         self.downsample_factor = as_tuple(downsample_factor, 2)
+        self.border_mode = border_mode
 
         input_shp, loc_shp = self.input_shapes
 
@@ -422,22 +430,23 @@ class TransformerLayer(MergeLayer):
     def get_output_shape_for(self, input_shapes):
         shape = input_shapes[0]
         factors = self.downsample_factor
-        return (shape[:2] + tuple(None if s is None else int(s / f)
+        return (shape[:2] + tuple(None if s is None else int(s // f)
                                   for s, f in zip(shape[2:], factors)))
 
     def get_output_for(self, inputs, **kwargs):
         # see eq. (1) and sec 3.1 in [1]
         input, theta = inputs
-        return _transform_affine(theta, input, self.downsample_factor)
+        return _transform_affine(theta, input, self.downsample_factor,
+                                 self.border_mode)
 
 
-def _transform_affine(theta, input, downsample_factor):
+def _transform_affine(theta, input, downsample_factor, border_mode):
     num_batch, num_channels, height, width = input.shape
     theta = T.reshape(theta, (-1, 2, 3))
 
     # grid of (x_t, y_t, 1), eq (1) in ref [1]
-    out_height = T.cast(height / downsample_factor[0], 'int64')
-    out_width = T.cast(width / downsample_factor[1], 'int64')
+    out_height = T.cast(height // downsample_factor[0], 'int64')
+    out_width = T.cast(width // downsample_factor[1], 'int64')
     grid = _meshgrid(out_height, out_width)
 
     # Transform A x (x_t, y_t, 1)^T -> (x_s, y_s)
@@ -451,7 +460,7 @@ def _transform_affine(theta, input, downsample_factor):
     input_dim = input.dimshuffle(0, 2, 3, 1)
     input_transformed = _interpolate(
         input_dim, x_s_flat, y_s_flat,
-        out_height, out_width)
+        out_height, out_width, border_mode)
 
     output = T.reshape(
         input_transformed, (num_batch, out_height, out_width, num_channels))
@@ -459,31 +468,45 @@ def _transform_affine(theta, input, downsample_factor):
     return output
 
 
-def _interpolate(im, x, y, out_height, out_width):
+def _interpolate(im, x, y, out_height, out_width, border_mode):
     # *_f are floats
     num_batch, height, width, channels = im.shape
     height_f = T.cast(height, theano.config.floatX)
     width_f = T.cast(width, theano.config.floatX)
-
-    # clip coordinates to [-1, 1]
-    x = T.clip(x, -1, 1)
-    y = T.clip(y, -1, 1)
 
     # scale coordinates from [-1, 1] to [0, width/height - 1]
     x = (x + 1) / 2 * (width_f - 1)
     y = (y + 1) / 2 * (height_f - 1)
 
     # obtain indices of the 2x2 pixel neighborhood surrounding the coordinates;
-    # we need those in floatX for interpolation and in int64 for indexing. for
-    # indexing, we need to take care they do not extend past the image.
+    # we need those in floatX for interpolation and in int64 for indexing.
     x0_f = T.floor(x)
     y0_f = T.floor(y)
     x1_f = x0_f + 1
     y1_f = y0_f + 1
-    x0 = T.cast(x0_f, 'int64')
-    y0 = T.cast(y0_f, 'int64')
-    x1 = T.cast(T.minimum(x1_f, width_f - 1), 'int64')
-    y1 = T.cast(T.minimum(y1_f, height_f - 1), 'int64')
+
+    # for indexing, we need to take care of the border mode for outside pixels.
+    if border_mode == 'nearest':
+        x0 = T.clip(x0_f, 0, width_f - 1)
+        x1 = T.clip(x1_f, 0, width_f - 1)
+        y0 = T.clip(y0_f, 0, height_f - 1)
+        y1 = T.clip(y1_f, 0, height_f - 1)
+    elif border_mode == 'mirror':
+        w = 2 * (width_f - 1)
+        x0 = T.minimum(x0_f % w, -x0_f % w)
+        x1 = T.minimum(x1_f % w, -x1_f % w)
+        h = 2 * (height_f - 1)
+        y0 = T.minimum(y0_f % h, -y0_f % h)
+        y1 = T.minimum(y1_f % h, -y1_f % h)
+    elif border_mode == 'wrap':
+        x0 = T.mod(x0_f, width_f)
+        x1 = T.mod(x1_f, width_f)
+        y0 = T.mod(y0_f, height_f)
+        y1 = T.mod(y1_f, height_f)
+    else:
+        raise ValueError("border_mode must be one of "
+                         "'nearest', 'mirror', 'wrap'")
+    x0, x1, y0, y1 = (T.cast(v, 'int64') for v in (x0, x1, y0, y1))
 
     # The input is [num_batch, height, width, channels]. We do the lookup in
     # the flattened input, i.e [num_batch*height*width, channels]. We need
@@ -589,6 +612,12 @@ class TPSTransformerLayer(MergeLayer):
         computed as part of the Theano computational graph, which is
         substantially slower as this computation scales with
         num_pixels*num_control_points. Default is 'auto'.
+    border_mode : 'nearest', 'mirror', or 'wrap'
+        Determines how border conditions are handled during interpolation.  If
+        'nearest', points outside the grid are clipped to the boundary'. If
+        'mirror', points are mirrored across the boundary. If 'wrap', points
+        wrap around to the other side of the grid.  See
+        http://stackoverflow.com/q/22669252/22670830#22670830 for details.
 
     References
     ----------
@@ -632,10 +661,12 @@ class TPSTransformerLayer(MergeLayer):
     """
 
     def __init__(self, incoming, localization_network, downsample_factor=1,
-                 control_points=16, precompute_grid='auto', **kwargs):
+                 control_points=16, precompute_grid='auto',
+                 border_mode='nearest', **kwargs):
         super(TPSTransformerLayer, self).__init__(
                 [incoming, localization_network], **kwargs)
 
+        self.border_mode = border_mode
         self.downsample_factor = as_tuple(downsample_factor, 2)
         self.control_points = control_points
 
@@ -675,7 +706,7 @@ class TPSTransformerLayer(MergeLayer):
     def get_output_shape_for(self, input_shapes):
         shape = input_shapes[0]
         factors = self.downsample_factor
-        return (shape[:2] + tuple(None if s is None else int(s / f)
+        return (shape[:2] + tuple(None if s is None else int(s // f)
                                   for s, f in zip(shape[2:], factors)))
 
     def get_output_for(self, inputs, **kwargs):
@@ -685,12 +716,12 @@ class TPSTransformerLayer(MergeLayer):
         return _transform_thin_plate_spline(
                 dest_offsets, input, self.right_mat, self.L_inv,
                 self.source_points, self.out_height, self.out_width,
-                self.precompute_grid, self.downsample_factor)
+                self.precompute_grid, self.downsample_factor, self.border_mode)
 
 
 def _transform_thin_plate_spline(
         dest_offsets, input, right_mat, L_inv, source_points, out_height,
-        out_width, precompute_grid, downsample_factor):
+        out_width, precompute_grid, downsample_factor, border_mode):
 
     num_batch, num_channels, height, width = input.shape
     num_control_points = source_points.shape[1]
@@ -712,8 +743,8 @@ def _transform_thin_plate_spline(
     else:
 
         # Transformed grid
-        out_height = T.cast(height / downsample_factor[0], 'int64')
-        out_width = T.cast(width / downsample_factor[1], 'int64')
+        out_height = T.cast(height // downsample_factor[0], 'int64')
+        out_width = T.cast(width // downsample_factor[1], 'int64')
         orig_grid = _meshgrid(out_height, out_width)
         orig_grid = orig_grid[0:2, :]
         orig_grid = T.tile(orig_grid, (num_batch, 1, 1))
@@ -731,7 +762,7 @@ def _transform_thin_plate_spline(
     input_dim = input.dimshuffle(0, 2, 3, 1)
     input_transformed = _interpolate(
             input_dim, x_transformed, y_transformed,
-            out_height, out_width)
+            out_height, out_width, border_mode)
 
     output = T.reshape(input_transformed,
                        (num_batch, out_height, out_width, num_channels))
@@ -869,8 +900,8 @@ def _initialize_tps(num_control_points, input_shape, downsample_factor,
 
     if precompute_grid:
         # Construct grid
-        out_height = np.array(height / downsample_factor[0]).astype('int64')
-        out_width = np.array(width / downsample_factor[1]).astype('int64')
+        out_height = np.array(height // downsample_factor[0]).astype('int64')
+        out_width = np.array(width // downsample_factor[1]).astype('int64')
         x_t, y_t = np.meshgrid(np.linspace(-1, 1, out_width),
                                np.linspace(-1, 1, out_height))
         ones = np.ones(np.prod(x_t.shape))
@@ -925,7 +956,7 @@ class ParametricRectifierLayer(Layer):
     alpha=init.Constant(0.25), shared_axes='auto', **kwargs)
 
     A layer that applies parametric rectify nonlinearity to its input
-    following [1]_ (http://arxiv.org/abs/1502.01852)
+    following [1]_.
 
     Equation for the parametric rectifier linear unit:
     :math:`\\varphi(x) = \\max(x,0) + \\alpha \\min(x,0)`
@@ -957,7 +988,7 @@ class ParametricRectifierLayer(Layer):
     .. [1] K He, X Zhang et al. (2015):
        Delving Deep into Rectifiers: Surpassing Human-Level Performance on
        ImageNet Classification,
-       http://link.springer.com/chapter/10.1007/3-540-49430-8_2
+       http://arxiv.org/abs/1502.01852
 
     Notes
     -----
@@ -976,7 +1007,7 @@ class ParametricRectifierLayer(Layer):
             self.shared_axes = (0,) + tuple(range(2, len(self.input_shape)))
         elif shared_axes == 'all':
             self.shared_axes = tuple(range(len(self.input_shape)))
-        elif isinstance(shared_axes, int):
+        elif isinstance(shared_axes, int_types):
             self.shared_axes = (shared_axes,)
         else:
             self.shared_axes = shared_axes
@@ -1017,6 +1048,7 @@ def prelu(layer, **kwargs):
     Examples
     --------
     Note that this function modifies an existing layer, like this:
+
     >>> from lasagne.layers import InputLayer, DenseLayer, prelu
     >>> layer = InputLayer((32, 100))
     >>> layer = DenseLayer(layer, num_units=200)
@@ -1088,7 +1120,7 @@ class RandomizedRectifierLayer(Layer):
             self.shared_axes = (0,) + tuple(range(2, len(self.input_shape)))
         elif shared_axes == 'all':
             self.shared_axes = tuple(range(len(self.input_shape)))
-        elif isinstance(shared_axes, int):
+        elif isinstance(shared_axes, int_types):
             self.shared_axes = (shared_axes,)
         else:
             self.shared_axes = shared_axes
@@ -1139,6 +1171,7 @@ def rrelu(layer, **kwargs):
     Examples
     --------
     Note that this function modifies an existing layer, like this:
+
     >>> from lasagne.layers import InputLayer, DenseLayer, rrelu
     >>> layer = InputLayer((32, 100))
     >>> layer = DenseLayer(layer, num_units=200)

@@ -11,6 +11,7 @@
     layers/input
     layers/dense
     layers/conv
+    layers/local
     layers/pool
     layers/recurrent
     layers/noise
@@ -71,6 +72,18 @@
 
     Conv1DLayer
     Conv2DLayer
+    Conv3DLayer
+    TransposedConv2DLayer
+    Deconv2DLayer
+    DilatedConv2DLayer
+
+
+.. rubric:: :doc:`layers/local`
+
+.. autosummary::
+    :nosignatures:
+
+    LocallyConnected2DLayer
 
 
 .. rubric:: :doc:`layers/pool`
@@ -80,13 +93,17 @@
 
     MaxPool1DLayer
     MaxPool2DLayer
+    MaxPool3DLayer
     Pool1DLayer
     Pool2DLayer
+    Pool3DLayer
     Upscale1DLayer
     Upscale2DLayer
+    Upscale3DLayer
     GlobalPoolLayer
     FeaturePoolLayer
     FeatureWTALayer
+    SpatialPyramidPoolingLayer
 
 
 .. rubric:: :doc:`layers/recurrent`
@@ -108,6 +125,9 @@
 
     DropoutLayer
     dropout
+    dropout_channels
+    spatial_dropout
+    dropout_locations
     GaussianNoiseLayer
 
 
@@ -146,6 +166,9 @@
     LocalResponseNormalization2DLayer
     BatchNormLayer
     batch_norm
+    StandardizationLayer
+    instance_norm
+    layer_norm
 
 
 .. rubric:: :doc:`layers/embedding`
@@ -163,9 +186,12 @@
 
     NonlinearityLayer
     BiasLayer
+    ScaleLayer
+    standardize
     ExpressionLayer
     InverseLayer
     TransformerLayer
+    TPSTransformerLayer
     ParametricRectifierLayer
     prelu
     RandomizedRectifierLayer
@@ -205,4 +231,7 @@
     dnn.Pool2DDNNLayer
     dnn.MaxPool3DDNNLayer
     dnn.Pool3DDNNLayer
+    dnn.SpatialPyramidPoolingDNNLayer
+    dnn.BatchNormDNNLayer
+    dnn.batch_norm_dnn
 

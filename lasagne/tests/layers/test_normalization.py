@@ -145,9 +145,17 @@ class TestLocalResponseNormalization2DLayer:
 
 
 class TestBatchNormLayer:
-    @pytest.fixture
-    def BatchNormLayer(self):
-        from lasagne.layers.normalization import BatchNormLayer
+    @pytest.fixture(params=(False, True), ids=('plain', 'dnn'))
+    def BatchNormLayer(self, request):
+        dnn = request.param
+        if not dnn:
+            from lasagne.layers.normalization import BatchNormLayer
+        elif dnn:
+            try:
+                from lasagne.layers.dnn import (
+                        BatchNormDNNLayer as BatchNormLayer)
+            except ImportError:
+                pytest.skip("cuDNN batch norm not available")
         return BatchNormLayer
 
     @pytest.fixture
@@ -164,8 +172,12 @@ class TestBatchNormLayer:
         beta = BatchNormLayer(input_shape, beta=init_unique, axes=0).beta
         assert np.allclose(beta.get_value(), init_unique((3, 4)))
         # normalize over second and third axis
-        beta = BatchNormLayer(input_shape, beta=init_unique, axes=(1, 2)).beta
-        assert np.allclose(beta.get_value(), init_unique((2,)))
+        try:
+            beta = BatchNormLayer(
+                    input_shape, beta=init_unique, axes=(1, 2)).beta
+            assert np.allclose(beta.get_value(), init_unique((2,)))
+        except ValueError as exc:
+            assert "BatchNormDNNLayer only supports" in exc.args[0]
 
     @pytest.mark.parametrize('update_averages', [None, True, False])
     @pytest.mark.parametrize('use_averages', [None, True, False])
@@ -224,7 +236,7 @@ class TestBatchNormLayer:
 
     def test_undefined_shape(self, BatchNormLayer):
         # should work:
-        BatchNormLayer((64, None, 3), axes=(1, 2))
+        BatchNormLayer((64, 2, None), axes=(0, 2))
         # should not work:
         with pytest.raises(ValueError) as exc:
             BatchNormLayer((64, None, 3), axes=(0, 2))
@@ -265,10 +277,29 @@ class TestBatchNormLayer:
         assert np.allclose(result1, exp_result1, **tol)
         assert np.allclose(result2, exp_result2, **tol)
 
+    def test_batch_norm_tag(self, BatchNormLayer):
+        input_shape = (20, 30, 40)
+        layer = BatchNormLayer(input_shape)
+        assert len(layer.get_params()) == 4
+        stat_params = layer.get_params(batch_norm_stat=True)
+        assert len(stat_params) == 2
+        param_names = [p.name for p in stat_params]
+        assert "mean" in param_names
+        assert "inv_std" in param_names
 
-def test_batch_norm_macro():
-    from lasagne.layers import (Layer, BatchNormLayer, batch_norm,
-                                NonlinearityLayer)
+
+@pytest.mark.parametrize('dnn', [False, True])
+def test_batch_norm_macro(dnn):
+    if not dnn:
+        from lasagne.layers import (BatchNormLayer, batch_norm)
+    else:
+        try:
+            from lasagne.layers.dnn import (
+                    BatchNormDNNLayer as BatchNormLayer,
+                    batch_norm_dnn as batch_norm)
+        except ImportError:
+            pytest.skip("cuDNN batch norm not available")
+    from lasagne.layers import (Layer, NonlinearityLayer)
     from lasagne.nonlinearities import identity
     input_shape = (2, 3)
     obj = object()
@@ -299,3 +330,276 @@ def test_batch_norm_macro():
     bnstack = batch_norm(layer, name='foo')
     assert isinstance(bnstack, BatchNormLayer)
     assert bnstack.name == 'foo'
+
+    # check if created layers are named with kwargs name
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    layer.name = 'foo'
+    bnstack = batch_norm(layer, name='foo_bnorm')
+    assert isinstance(bnstack, NonlinearityLayer)
+    assert isinstance(bnstack.input_layer, BatchNormLayer)
+    assert bnstack.name == 'foo_bnorm_nonlin'
+    assert bnstack.input_layer.name == 'foo_bnorm'
+
+    # check if created layers are named with wrapped layer name
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    layer.name = 'foo'
+    bnstack = batch_norm(layer)
+    assert isinstance(bnstack, NonlinearityLayer)
+    assert isinstance(bnstack.input_layer, BatchNormLayer)
+    assert bnstack.name == 'foo_bn_nonlin'
+    assert bnstack.input_layer.name == 'foo_bn'
+
+    # check if created layers remain unnamed if no names are given
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    bnstack = batch_norm(layer)
+    assert isinstance(bnstack, NonlinearityLayer)
+    assert isinstance(bnstack.input_layer, BatchNormLayer)
+    assert bnstack.name is None
+    assert bnstack.input_layer.name is None
+
+
+class TestStandardizationLayer:
+
+    @pytest.fixture
+    def layer(self):
+        from lasagne.layers.normalization import StandardizationLayer
+        input_shape = (2, 3, 4)
+        layer = StandardizationLayer(input_shape)
+        return layer
+
+    def test_get_params(self, layer):
+        assert layer.get_params() == []
+
+    def test_get_output_shape_for(self, layer):
+        assert layer.get_output_shape_for((1, 2, 3, 4)) == (1, 2, 3, 4)
+
+    @pytest.mark.parametrize('axes', ['auto', 'features', 'spatial', (1,), 1])
+    @pytest.mark.parametrize('input_shape', [(5, 10), (5, 10, 15),
+                                             (5, 10, 15, 15),
+                                             (5, 10, 15, 15, 15)])
+    def test_get_output_for(self, axes, input_shape):
+        rand_shape = [1]*len(input_shape)
+        rand_shape[1] = 10
+        # random input tensor
+        input = (np.random.randn(*input_shape).astype(theano.config.floatX) +
+                 np.random.randn(*rand_shape).astype(theano.config.floatX))
+
+        # create layer
+        from lasagne.layers.normalization import StandardizationLayer
+        layer = StandardizationLayer(input_shape, axes=axes)
+
+        def get_exp_result(axis):
+            input_mean = input.mean(axis=axis, keepdims=True)
+            input_std = np.sqrt(input.var(axis=axis, keepdims=True) +
+                                layer.epsilon)
+            return (input - input_mean) / input_std
+
+        # choose normalization axes according to specification
+        if axes == 'auto' and len(input_shape) > 2:
+            axes = tuple(range(2, len(input_shape)))
+        elif axes == 'auto' and len(input_shape) == 2:
+            axes = (1,)
+        elif axes == 'spatial':
+            axes = tuple(range(2, len(input_shape)))
+        elif axes == 'features':
+            axes = tuple(range(1, len(input_shape)))
+        else:
+            axes = axes
+
+        exp_result = get_exp_result(axes)
+
+        kwargs = {'deterministic': True}
+        result = layer.get_output_for(theano.tensor.constant(input),
+                                      **kwargs).eval()
+
+        # compare expected results to actual results
+        tol = {'atol': 1e-5, 'rtol': 1e-6}
+        assert np.allclose(result, exp_result, **tol)
+
+
+@pytest.mark.parametrize('learn_bias', [True, False])
+@pytest.mark.parametrize('learn_scale', [True, False])
+def test_instance_norm_macro(learn_bias, learn_scale):
+    from lasagne.layers import (Layer, NonlinearityLayer, StandardizationLayer,
+                                ScaleLayer, BiasLayer, instance_norm)
+    from lasagne.nonlinearities import identity
+    input_shape = (2, 3, 4, 4)
+    obj = object()
+
+    # check if it steals the nonlinearity
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    instack = instance_norm(layer, learn_bias=learn_bias,
+                            learn_scale=learn_scale)
+    assert isinstance(instack, NonlinearityLayer)
+    assert layer.nonlinearity is identity
+    assert instack.nonlinearity is obj
+
+    # check if layers are set according to specification
+    if learn_bias:
+        assert isinstance(instack.input_layer, BiasLayer)
+        if learn_scale:
+            assert isinstance(instack.input_layer.input_layer, ScaleLayer)
+            assert isinstance(instack.input_layer.input_layer.input_layer,
+                              StandardizationLayer)
+        else:
+            assert isinstance(instack.input_layer.input_layer,
+                              StandardizationLayer)
+
+    elif learn_scale:
+        assert isinstance(instack.input_layer, ScaleLayer)
+        assert isinstance(instack.input_layer.input_layer,
+                          StandardizationLayer)
+    else:
+        assert isinstance(instack.input_layer, StandardizationLayer)
+
+    # check if it removes the bias
+    layer = Mock(Layer, output_shape=input_shape, b=obj, params={obj: set()})
+    instack = instance_norm(layer)
+    assert layer.b is None
+    assert obj not in layer.params
+
+    # check if it can handle an unset bias
+    layer = Mock(Layer, output_shape=input_shape, b=None, params={obj: set()})
+    instack = instance_norm(layer)
+    assert layer.b is None
+
+
+def test_instance_norm_macro_kwargs():
+    from lasagne.layers import (Layer, NonlinearityLayer, StandardizationLayer,
+                                ScaleLayer, BiasLayer, instance_norm)
+    from lasagne.nonlinearities import identity
+    input_shape = (2, 3, 4, 4)
+    obj = object()
+
+    # check if it passes on kwargs
+    layer = Mock(Layer, output_shape=input_shape)
+    instack = instance_norm(layer, learn_bias=False, learn_scale=False,
+                            name='foo')
+    assert isinstance(instack, StandardizationLayer)
+    assert instack.name == 'foo'
+
+    # check if created layers are named with kwargs name
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    layer.name = 'foo'
+    instack = instance_norm(layer, name='foo_inorm')
+    assert isinstance(instack, NonlinearityLayer)
+    assert instack.name == 'foo_inorm_nonlin'
+    assert isinstance(instack.input_layer, BiasLayer)
+    assert instack.input_layer.name == 'foo_inorm_bias'
+    assert isinstance(instack.input_layer.input_layer, ScaleLayer)
+    assert instack.input_layer.input_layer.name == 'foo_inorm_scale'
+    assert isinstance(instack.input_layer.input_layer.input_layer,
+                      StandardizationLayer)
+    assert instack.input_layer.input_layer.input_layer.name == 'foo_inorm'
+
+    # check if created layers are named with wrapped layer name
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    layer.name = 'foo'
+    instack = instance_norm(layer)
+    assert isinstance(instack, NonlinearityLayer)
+    assert instack.name == 'foo_in_nonlin'
+    assert isinstance(instack.input_layer, BiasLayer)
+    assert instack.input_layer.name == 'foo_in_bias'
+    assert isinstance(instack.input_layer.input_layer, ScaleLayer)
+    assert instack.input_layer.input_layer.name == 'foo_in_scale'
+    assert isinstance(instack.input_layer.input_layer.input_layer,
+                      StandardizationLayer)
+    assert instack.input_layer.input_layer.input_layer.name == 'foo_in'
+
+    # check if created layers remain unnamed if no names are given
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    instack = instance_norm(layer)
+    assert isinstance(instack, NonlinearityLayer)
+    assert instack.name is None
+    assert isinstance(instack.input_layer, BiasLayer)
+    assert instack.input_layer.name is None
+    assert isinstance(instack.input_layer.input_layer, ScaleLayer)
+    assert instack.input_layer.input_layer.name is None
+    assert isinstance(instack.input_layer.input_layer.input_layer,
+                      StandardizationLayer)
+    assert instack.input_layer.input_layer.input_layer.name is None
+
+
+def test_layer_norm_macro():
+    from lasagne.layers import (Layer, NonlinearityLayer, StandardizationLayer,
+                                ScaleLayer, BiasLayer, layer_norm)
+    from lasagne.nonlinearities import identity
+    input_shape = (2, 3)
+    obj = object()
+
+    # check if it steals the nonlinearity and applies StandardizationLayer,
+    #  ScaleLayer and BiasLayer on top of the input layer
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    lnstack = layer_norm(layer)
+    assert isinstance(lnstack, NonlinearityLayer)
+    assert isinstance(lnstack.input_layer, BiasLayer)
+    assert isinstance(lnstack.input_layer.input_layer, ScaleLayer)
+    assert isinstance(lnstack.input_layer.input_layer.input_layer,
+                      StandardizationLayer)
+    assert layer.nonlinearity is identity
+    assert lnstack.nonlinearity is obj
+
+    # check if it removes the bias
+    layer = Mock(Layer, output_shape=input_shape, b=obj, params={obj: set()})
+    lnstack = layer_norm(layer)
+    assert layer.b is None
+    assert obj not in layer.params
+
+    # check if it can handle an unset bias
+    layer = Mock(Layer, output_shape=input_shape, b=None, params={obj: set()})
+    lnstack = layer_norm(layer)
+    assert layer.b is None
+
+    # check if it passes on kwargs
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    lnstack = layer_norm(layer, name='foo_lnorm')
+    assert isinstance(lnstack, NonlinearityLayer)
+    assert lnstack.name == 'foo_lnorm_nonlin'
+    assert isinstance(lnstack.input_layer, BiasLayer)
+    assert lnstack.input_layer.name == 'foo_lnorm_bias'
+    assert isinstance(lnstack.input_layer.input_layer, ScaleLayer)
+    assert lnstack.input_layer.input_layer.name == 'foo_lnorm_scale'
+    assert isinstance(lnstack.input_layer.input_layer.input_layer,
+                      StandardizationLayer)
+    assert lnstack.input_layer.input_layer.input_layer.name == 'foo_lnorm'
+
+    # check if created layers are named with kwargs name
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    layer.name = 'foo'
+    lnstack = layer_norm(layer, name='foo_lnorm')
+    assert isinstance(lnstack, NonlinearityLayer)
+    assert lnstack.name == 'foo_lnorm_nonlin'
+    assert isinstance(lnstack.input_layer, BiasLayer)
+    assert lnstack.input_layer.name == 'foo_lnorm_bias'
+    assert isinstance(lnstack.input_layer.input_layer, ScaleLayer)
+    assert lnstack.input_layer.input_layer.name == 'foo_lnorm_scale'
+    assert isinstance(lnstack.input_layer.input_layer.input_layer,
+                      StandardizationLayer)
+    assert lnstack.input_layer.input_layer.input_layer.name == 'foo_lnorm'
+
+    # check if created layers are named with wrapped layer name
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    layer.name = 'foo'
+    lnstack = layer_norm(layer)
+    assert isinstance(lnstack, NonlinearityLayer)
+    assert lnstack.name == 'foo_ln_nonlin'
+    assert isinstance(lnstack.input_layer, BiasLayer)
+    assert lnstack.input_layer.name == 'foo_ln_bias'
+    assert isinstance(lnstack.input_layer.input_layer, ScaleLayer)
+    assert lnstack.input_layer.input_layer.name == 'foo_ln_scale'
+    assert isinstance(lnstack.input_layer.input_layer.input_layer,
+                      StandardizationLayer)
+    assert lnstack.input_layer.input_layer.input_layer.name == 'foo_ln'
+
+    # check if created layers remain unnamed if no names are given
+    layer = Mock(Layer, output_shape=input_shape, nonlinearity=obj)
+    lnstack = layer_norm(layer)
+    assert isinstance(lnstack, NonlinearityLayer)
+    assert lnstack.name is None
+    assert isinstance(lnstack.input_layer, BiasLayer)
+    assert lnstack.input_layer.name is None
+    assert isinstance(lnstack.input_layer.input_layer, ScaleLayer)
+    assert lnstack.input_layer.input_layer.name is None
+    assert isinstance(lnstack.input_layer.input_layer.input_layer,
+                      StandardizationLayer)
+    assert lnstack.input_layer.input_layer.input_layer.name is None
