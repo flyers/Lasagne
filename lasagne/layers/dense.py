@@ -74,6 +74,7 @@ class DenseLayer(Layer):
     """
     def __init__(self, incoming, num_units, W=init.GlorotUniform(),
                  b=init.Constant(0.), nonlinearity=nonlinearities.rectify,
+                 trainable=True, regularizable=True,
                  num_leading_axes=1, **kwargs):
         super(DenseLayer, self).__init__(incoming, **kwargs)
         self.nonlinearity = (nonlinearities.identity if nonlinearity is None
@@ -100,11 +101,13 @@ class DenseLayer(Layer):
                     (self.input_shape, self.num_leading_axes))
         num_inputs = int(np.prod(self.input_shape[num_leading_axes:]))
 
-        self.W = self.add_param(W, (num_inputs, num_units), name="W")
+        self.W = self.add_param(W, (num_inputs, num_units), name="W",
+                                trainable=trainable, regularizable=regularizable)
         if b is None:
             self.b = None
         else:
             self.b = self.add_param(b, (num_units,), name="b",
+                                    trainable=trainable,
                                     regularizable=False)
 
     def get_output_shape_for(self, input_shape):
